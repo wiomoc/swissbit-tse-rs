@@ -2,18 +2,18 @@ extern crate byteorder;
 #[cfg(windows)]
 extern crate windows;
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 extern crate libc;
 
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::ops::Range;
+
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration};
 
 #[derive(Debug)]
 pub enum TseError {
@@ -58,7 +58,7 @@ fn open_file_direct(filename: OsString) -> Result<File> {
     }
 }
 
-#[cfg(linux)]
+#[cfg(target_os = "linux")]
 fn open_file_direct(filename: OsString) -> Result<File> {
     let filename = CString::new(filename.to_str().unwrap()).unwrap();
     unsafe {
@@ -100,36 +100,35 @@ impl InitializationState {
 
 #[derive(Debug)]
 pub struct SignedTransaction {
-    transaction_id: u64,
-    serial: Vec<u8>,
-    log_time: u64,
-    signature_counter: u64,
-    signature: Vec<u8>,
+    pub transaction_id: u64,
+    pub serial: Vec<u8>,
+    pub log_time: u64,
+    pub signature_counter: u64,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub struct TseInfo {
-    description: String,
-    public_key: Vec<u8>,
-    serial_number: Vec<u8>,
-    size: u32,
-    certificate_expiration_date: u32,
-    software_version: u32,
-    created_signatures: u32,
-    max_signatures: u32,
-    registered_clients: u32,
-    max_registered_client: u32,
-    time_until_next_self_test: u32,
-    time_until_next_time_synchronization: u32,
-    tar_export_size: u64,
-    has_passed_self_test: bool,
-    has_valid_time: bool,
-    has_changed_puk: bool,
-    has_changed_admin_pin: bool,
-    has_changed_time_admin_pin: bool,
-
-    initialization_state: InitializationState,
-    is_transaction_in_progress: bool,
+    pub description: String,
+    pub public_key: Vec<u8>,
+    pub serial_number: Vec<u8>,
+    pub size: u32,
+    pub certificate_expiration_date: u32,
+    pub software_version: u32,
+    pub created_signatures: u32,
+    pub max_signatures: u32,
+    pub registered_clients: u32,
+    pub max_registered_client: u32,
+    pub time_until_next_self_test: u32,
+    pub time_until_next_time_synchronization: u32,
+    pub tar_export_size: u64,
+    pub has_passed_self_test: bool,
+    pub has_valid_time: bool,
+    pub has_changed_puk: bool,
+    pub has_changed_admin_pin: bool,
+    pub has_changed_time_admin_pin: bool,
+    pub initialization_state: InitializationState,
+    pub is_transaction_in_progress: bool,
 }
 
 impl TseInfo {
@@ -146,7 +145,7 @@ impl TseInfo {
             description: String::from_utf8_lossy(
                 &info_file_contents[0x120
                     ..0x120
-                        + (&info_file_contents[0x120..])
+                        + info_file_contents[0x120..]
                             .iter()
                             .position(|b| *b == b'\0')
                             .unwrap()],
@@ -204,20 +203,20 @@ impl TseCommunication {
     fn write_command(&mut self, cmd: &[u8]) -> Result<()> {
         let mut buf = Cursor::new(vec![0u8; BLOCK_SIZE]);
         buf.write_u16::<BigEndian>(cmd.len() as u16).unwrap();
-        buf.write(cmd).unwrap();
+        buf.write_all(cmd).unwrap();
         self.write(buf.get_ref())
     }
 
     pub(crate) fn send_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>> {
         let mut read_buf = [0u8; BLOCK_SIZE];
         self.read(&mut read_buf)?;
-        let before_counter = BigEndian::read_u32(&read_buf[0..4]);
+        let _before_counter = BigEndian::read_u32(&read_buf[0..4]);
         self.write_command(cmd)?;
 
         let max_trys = 3000;
         for _ in 0..max_trys {
             self.read(&mut read_buf)?;
-            let response_counter = BigEndian::read_u32(&read_buf[0..4]);
+            let _response_counter = BigEndian::read_u32(&read_buf[0..4]);
             let response_status = read_buf[4];
             if response_status == 0xf3
             /*|| response_counter == before_counter*/
@@ -238,7 +237,7 @@ impl TseCommunication {
                 };
             }
         }
-        return Err(TseError::Timeout);
+        Err(TseError::Timeout)
     }
 }
 
@@ -260,7 +259,7 @@ impl TseTarFiles {
                 break;
             }
         }
-        return Ok(Self { files });
+        Ok(Self { files })
     }
 
     fn write(&mut self, block_offset: usize, data: &[u8]) -> Result<()> {
@@ -268,9 +267,9 @@ impl TseTarFiles {
             return Ok(());
         }
 
-        let mut data = &data[..];
+        let mut data = data;
         let mut block_offset = block_offset;
-        while data.len() > 0 {
+        while !data.is_empty() {
             let file_total_blocks = 2097152;
             let file_index = block_offset / file_total_blocks;
             if file_index > self.files.len() {
