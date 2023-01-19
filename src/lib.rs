@@ -13,7 +13,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::Path;
 use std::thread;
-use std::time::{Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum TseError {
@@ -32,6 +32,15 @@ impl From<std::io::Error> for TseError {
 pub type Result<T> = std::result::Result<T, TseError>;
 
 const BLOCK_SIZE: usize = 512;
+
+pub const ERROR_INVALID_PARAMETER: u16 = 4103;
+pub const ERROR_NO_TIME_SET: u16 = 4098;
+pub const ERROR_NOT_AUTHORIZED: u16 = 4111;
+pub const ERROR_CLIENT_NOT_REGISTERED: u16 = 4113;
+pub const ERROR_NEEDS_ACTIVE_CTSS: u16 = 4179;
+pub const ERROR_NEEDS_SELF_TEST: u16 = 4180;
+pub const ERROR_NEEDS_SELF_TEST_PASSED: u16 = 4181;
+pub const ERROR_NOT_INITIALIZED: u16 = 4351;
 
 #[cfg(windows)]
 fn open_file_direct(filename: OsString) -> Result<File> {
@@ -74,13 +83,21 @@ fn open_file_direct(filename: OsString) -> Result<File> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub enum TransactionEvent {
+    Start = 0,
+    Update = 1,
+    Finish = 2,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum InitializationState {
     Uninitialized = 0,
     Initialized = 1,
     Decommissioned = 2,
 }
 
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum UserId {
     Unauthenticated = 0,
     Admin = 1,
@@ -174,12 +191,12 @@ impl TseInfo {
     }
 }
 
-struct TseCommunication {
+pub struct TseCommunication {
     file: File,
 }
 
 impl TseCommunication {
-    fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let filename = path
             .as_ref()
             .with_file_name("TSE_COMM.DAT")
@@ -191,10 +208,12 @@ impl TseCommunication {
     fn read(&mut self, buffer: &mut [u8]) -> Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.read_exact(buffer)?;
+        println!("READ {:?}", buffer);
         Ok(())
     }
 
     fn write(&mut self, buffer: &[u8]) -> Result<()> {
+        println!("WRITE {:?}", buffer);
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(buffer)?;
         Ok(())
@@ -207,7 +226,7 @@ impl TseCommunication {
         self.write(buf.get_ref())
     }
 
-    pub(crate) fn send_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>> {
+    fn send_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>> {
         let mut read_buf = [0u8; BLOCK_SIZE];
         self.read(&mut read_buf)?;
         let _before_counter = BigEndian::read_u32(&read_buf[0..4]);
@@ -238,6 +257,172 @@ impl TseCommunication {
             }
         }
         Err(TseError::Timeout)
+    }
+
+    pub fn run_selftest(&mut self, client_id: &str) -> Result<()> {
+        let mut cmd = vec![0x40, 0, client_id.len() as u8];
+        cmd.extend_from_slice(client_id.as_bytes());
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
+    pub fn login(&mut self, user_id: UserId, pin: &str) -> Result<()> {
+        let mut cmd = vec![0x20, 0, user_id as u8, pin.len() as u8];
+        cmd.extend_from_slice(pin.as_bytes());
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
+    pub fn update_time(&mut self, timestamp: u64) -> Result<()> {
+        let mut cmd = Cursor::new(Vec::with_capacity(10));
+        cmd.write_all(&[0x80, 0]).unwrap();
+        cmd.write_u64::<BigEndian>(timestamp).unwrap();
+        self.send_command(cmd.get_ref())?;
+        Ok(())
+    }
+
+    pub fn read_certificate(&mut self) -> Result<Vec<u8>> {
+        let mut cert = Vec::new();
+        loop {
+            let mut cmd = vec![0x86, 0, 0, 0, 0, 0];
+            BigEndian::write_u32(&mut cmd[2..], cert.len() as u32);
+            match self.send_command(&cmd) {
+                Ok(response) => {
+                    let response_len = BigEndian::read_u16(&response[..2]);
+                    if response_len == 0 {
+                        return Ok(cert);
+                    }
+                    cert.extend_from_slice(&response[2..])
+                }
+                Err(TseError::CmdError(ERROR_INVALID_PARAMETER, _)) => return Ok(cert),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn list_started_transactions(&mut self, client_id: &str) -> Result<Vec<u64>> {
+        let mut transaction_ids = Vec::new();
+        loop {
+            let mut cmd = vec![0x85, 0, 0, 0, 0, 0, client_id.len() as u8];
+            BigEndian::write_u32(&mut cmd[2..], transaction_ids.len() as u32);
+            cmd.extend_from_slice(client_id.as_bytes());
+            match self.send_command(&cmd) {
+                Ok(response) => {
+                    if response.is_empty() {
+                        return Ok(transaction_ids)
+                    }
+                    let amount = response[0];
+                    transaction_ids.extend(
+                        response[1..]
+                            .chunks(8)
+                            .take(amount as usize)
+                            .map(BigEndian::read_u64),
+                    );
+                    if amount < 62 {
+                        return Ok(transaction_ids);
+                    }
+                }
+                Err(TseError::CmdError(ERROR_INVALID_PARAMETER, _)) => return Ok(transaction_ids),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub fn register_client(&mut self, client_id: &str) -> Result<()> {
+        let mut cmd = vec![0x41, 0, client_id.len() as u8];
+        cmd.extend_from_slice(client_id.as_bytes());
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
+    pub fn deregister_client(&mut self, client_id: &str) -> Result<()> {
+        let mut cmd = vec![0x42, 0, client_id.len() as u8];
+        cmd.extend_from_slice(client_id.as_bytes());
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
+    pub fn enable_ctss_interface(&mut self) -> Result<()> {
+        self.send_command(&[0x60, 0])?;
+        Ok(())
+    }
+
+    pub fn disable_ctss_interface(&mut self) -> Result<()> {
+        self.send_command(&[0x61, 0])?;
+        Ok(())
+    }
+
+    pub fn initialize(&mut self) -> Result<()> {
+        self.send_command(&[0x70, 0])?;
+        Ok(())
+    }
+
+    pub fn list_clients(&mut self) -> Result<Vec<String>> {
+        let mut clients = vec![];
+        loop {
+            let mut cmd = vec![0x43, 0, 0, 0, 0, 0];
+            BigEndian::write_u32(&mut cmd[2..], clients.len() as u32);
+            match self.send_command(&cmd) {
+                Ok(response) => {
+                    let amount_clients = response[0];
+                    clients.extend(response[1..].chunks(32).take(amount_clients as usize).map(
+                        |chunk| {
+                            String::from_utf8_lossy(
+                                &chunk[..chunk.iter().position(|b| *b == b'\0').unwrap()],
+                            )
+                            .to_string()
+                        },
+                    ));
+
+                    if amount_clients < 16 {
+                        return Ok(clients);
+                    }
+                }
+                Err(TseError::CmdError(ERROR_INVALID_PARAMETER, _)) => return Ok(clients),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn open_transaction(
+        &mut self,
+        client_id: &str,
+        transaction_event: u8,
+        transaction_id: u64,
+        process_data_length: u64,
+        process_type: &str,
+    ) -> Result<usize> {
+        let mut cmd = Cursor::new(Vec::new());
+        cmd.write_all(&[0x90, 0, transaction_event, client_id.len() as u8])
+            .unwrap();
+        cmd.write_all(client_id.as_bytes()).unwrap();
+        cmd.write_u64::<BigEndian>(transaction_id).unwrap();
+        cmd.write_u64::<BigEndian>(process_data_length).unwrap();
+        cmd.write_u64::<BigEndian>(process_type.len() as u64)
+            .unwrap();
+        cmd.write_all(process_type.as_bytes()).unwrap();
+        cmd.write_u64::<BigEndian>(0).unwrap();
+        let block_offset_response = self.send_command(cmd.get_ref())?;
+        Ok(BigEndian::read_u64(&block_offset_response) as usize)
+    }
+
+    fn close_transaction(&mut self) -> Result<SignedTransaction> {
+        let mut response = Cursor::new(self.send_command(&[0x95, 0])?);
+        let transaction_id = response.read_u64::<BigEndian>().unwrap();
+        let mut serial = vec![0u8; 32];
+        response.read_exact(&mut serial).unwrap();
+        let log_time = response.read_u64::<BigEndian>().unwrap();
+        let signature_counter = response.read_u64::<BigEndian>().unwrap();
+        let signature_len = response.read_u64::<BigEndian>().unwrap();
+        let mut signature = vec![0u8; signature_len as usize];
+        response.read_exact(&mut signature).unwrap();
+        Ok(SignedTransaction {
+            transaction_id,
+            serial,
+            log_time,
+            signature_counter,
+            signature,
+        })
     }
 }
 
@@ -298,195 +483,120 @@ impl TseTarFiles {
 pub struct Tse {
     conn: TseCommunication,
     store: TseTarFiles,
+    time_admin_pin: String,
 }
 
 impl Tse {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, time_admin_pin: String) -> Result<Self> {
         Ok(Tse {
             conn: TseCommunication::open(path.as_ref())?,
             store: TseTarFiles::open(path)?,
+            time_admin_pin,
         })
     }
 
-    pub fn run_selftest(&mut self, client_id: &str) -> Result<()> {
-        let mut cmd = vec![0x40, 0, client_id.len() as u8];
-        cmd.extend_from_slice(client_id.as_bytes());
-        self.conn.send_command(&cmd)?;
-        Ok(())
-    }
-
-    pub fn login(&mut self, user_id: UserId, pin: &str) -> Result<()> {
-        let mut cmd = vec![0x20, 0, user_id as u8, pin.len() as u8];
-        cmd.extend_from_slice(pin.as_bytes());
-        self.conn.send_command(&cmd)?;
-        Ok(())
-    }
-
-    pub fn update_time(&mut self, timestamp: u64) -> Result<()> {
-        let mut cmd = Cursor::new(Vec::with_capacity(10));
-        cmd.write_all(&[0x80, 0]).unwrap();
-        cmd.write_u64::<BigEndian>(timestamp).unwrap();
-        self.conn.send_command(cmd.get_ref())?;
-        Ok(())
-    }
-
-    pub fn read_certificate(&mut self) -> Result<Vec<u8>> {
-        let mut cert = Vec::new();
-        loop {
-            let mut cmd = vec![0x86, 0, 0, 0, 0, 0];
-            BigEndian::write_u32(&mut cmd[2..], cert.len() as u32);
-            match self.conn.send_command(&cmd) {
-                Ok(response) => {
-                    let response_len = BigEndian::read_u16(&response[..2]);
-                    if response_len == 0 {
-                        return Ok(cert);
-                    }
-                    cert.extend_from_slice(&response[2..])
+    pub fn register_client(&mut self, client_id: &str, admin_pin: Option<&str>) -> Result<()> {
+        self.retry_command(
+            None,
+            |tse| match tse.conn.register_client(client_id) {
+                Err(TseError::CmdError(ERROR_NOT_AUTHORIZED, ..)) if admin_pin.is_some() => {
+                    tse.conn.login(UserId::Admin, admin_pin.unwrap())?;
+                    tse.conn.register_client(client_id)
                 }
-                Err(TseError::CmdError(1, _)) => return Ok(cert),
-                Err(e) => return Err(e),
-            }
-        }
+                e => e,
+            },
+            3,
+        )
     }
 
     pub fn list_started_transactions(&mut self, client_id: &str) -> Result<Vec<u64>> {
-        let mut transaction_ids = Vec::new();
-        loop {
-            let mut cmd = vec![0x85, 0, 0, 0, 0, 0, client_id.len() as u8];
-            BigEndian::write_u32(&mut cmd[2..], transaction_ids.len() as u32);
-            cmd.extend_from_slice(client_id.as_bytes());
-            match self.conn.send_command(&cmd) {
-                Ok(response) => {
-                    let amount = response[0];
-                    transaction_ids.extend(
-                        response[1..]
-                            .chunks(8)
-                            .take(amount as usize)
-                            .map(BigEndian::read_u64),
-                    );
-                    if amount < 62 {
-                        return Ok(transaction_ids);
-                    }
-                }
-                Err(TseError::CmdError(1, _)) => return Ok(transaction_ids),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    pub fn register_client(&mut self, client_id: &str) -> Result<()> {
-        let mut cmd = vec![0x41, 0, client_id.len() as u8];
-        cmd.extend_from_slice(client_id.as_bytes());
-        self.conn.send_command(&cmd)?;
-        Ok(())
-    }
-
-    pub fn deregister_client(&mut self, client_id: &str) -> Result<()> {
-        let mut cmd = vec![0x42, 0, client_id.len() as u8];
-        cmd.extend_from_slice(client_id.as_bytes());
-        self.conn.send_command(&cmd)?;
-        Ok(())
-    }
-
-    pub fn enable_ctss_interface(&mut self) -> Result<()> {
-        self.conn.send_command(&[0x60, 0])?;
-        Ok(())
-    }
-
-    pub fn disable_ctss_interface(&mut self) -> Result<()> {
-        self.conn.send_command(&[0x61, 0])?;
-        Ok(())
-    }
-
-    pub fn initialize(&mut self) -> Result<()> {
-        self.conn.send_command(&[0x70, 0])?;
-        Ok(())
+        self.retry_command(
+            Some(client_id),
+            |tse| tse.conn.list_started_transactions(client_id),
+            3,
+        )
     }
 
     pub fn list_clients(&mut self) -> Result<Vec<String>> {
-        let mut clients = vec![];
-        loop {
-            let mut cmd = vec![0x43, 0, 0, 0, 0, 0];
-            BigEndian::write_u32(&mut cmd[2..], clients.len() as u32);
-            match self.conn.send_command(&cmd) {
-                Ok(response) => {
-                    let amount_clients = response[0];
-                    clients.extend(response[1..].chunks(32).take(amount_clients as usize).map(
-                        |chunk| {
-                            String::from_utf8_lossy(
-                                &chunk[..chunk.iter().position(|b| *b == b'\0').unwrap()],
-                            )
-                            .to_string()
-                        },
-                    ));
-
-                    if amount_clients < 16 {
-                        return Ok(clients);
-                    }
-                }
-                Err(TseError::CmdError(1, _)) => return Ok(clients),
-                Err(e) => return Err(e),
-            }
-        }
+        self.retry_command(None, |tse| tse.conn.list_clients(), 3)
     }
 
-    fn open_transaction(
-        &mut self,
-        client_id: &str,
-        transaction_event: u8,
-        transaction_id: u64,
-        process_data_length: u64,
-        process_type: &str,
-    ) -> Result<usize> {
-        let mut cmd = Cursor::new(Vec::new());
-        cmd.write_all(&[0x90, 0, transaction_event, client_id.len() as u8])
-            .unwrap();
-        cmd.write_all(client_id.as_bytes()).unwrap();
-        cmd.write_u64::<BigEndian>(transaction_id).unwrap();
-        cmd.write_u64::<BigEndian>(process_data_length).unwrap();
-        cmd.write_u64::<BigEndian>(process_type.len() as u64)
-            .unwrap();
-        cmd.write_all(process_type.as_bytes()).unwrap();
-        cmd.write_u64::<BigEndian>(0).unwrap();
-        let block_offset_response = self.conn.send_command(cmd.get_ref())?;
-        Ok(BigEndian::read_u64(&block_offset_response) as usize)
-    }
-
-    fn close_transaction(&mut self) -> Result<SignedTransaction> {
-        let mut response = Cursor::new(self.conn.send_command(&[0x95, 0])?);
-        let transaction_id = response.read_u64::<BigEndian>().unwrap();
-        let mut serial = vec![0u8; 32];
-        response.read_exact(&mut serial).unwrap();
-        let log_time = response.read_u64::<BigEndian>().unwrap();
-        let signature_counter = response.read_u64::<BigEndian>().unwrap();
-        let signature_len = response.read_u64::<BigEndian>().unwrap();
-        let mut signature = vec![0u8; signature_len as usize];
-        response.read_exact(&mut signature).unwrap();
-        Ok(SignedTransaction {
-            transaction_id,
-            serial,
-            log_time,
-            signature_counter,
-            signature,
-        })
+    pub fn read_certificate(&mut self) -> Result<Vec<u8>> {
+        self.retry_command(None, |tse| tse.conn.read_certificate(), 3)
     }
 
     pub fn persist_transaction(
         &mut self,
         client_id: &str,
-        transaction_event: u8,
+        transaction_event: TransactionEvent,
         transaction_id: u64,
         process_type: &str,
         process_data: &[u8],
     ) -> Result<SignedTransaction> {
-        let block_offset = self.open_transaction(
-            client_id,
-            transaction_event,
-            transaction_id,
-            process_data.len() as u64,
-            process_type,
+        let block_offset = self.retry_command(
+            Some(client_id),
+            move |tse| {
+                tse.conn.open_transaction(
+                    client_id,
+                    transaction_event as u8,
+                    transaction_id,
+                    process_data.len() as u64,
+                    process_type,
+                )
+            },
+            4,
         )?;
         self.store.write(block_offset, process_data)?;
-        self.close_transaction()
+        self.retry_command(Some(client_id), |tse| tse.conn.close_transaction(), 2)
+    }
+
+    fn retry_command<T, F: Fn(&mut Tse) -> Result<T>>(
+        &mut self,
+        client_id: Option<&str>,
+        fun: F,
+        max_trys: u8,
+    ) -> Result<T> {
+        if max_trys == 0 {
+            return Err(TseError::Timeout);
+        }
+        match fun(self) {
+            Err(TseError::CmdError(ERROR_NO_TIME_SET, ..)) => {
+                self.conn.update_time(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                )?;
+                self.retry_command(client_id, fun, max_trys - 1)
+            }
+            Err(TseError::CmdError(ERROR_NEEDS_SELF_TEST | ERROR_NEEDS_SELF_TEST_PASSED, ..))
+                if client_id.is_some() =>
+            {
+                self.conn.run_selftest(client_id.unwrap())?;
+                self.conn
+                    .login(UserId::TimeAdmin, self.time_admin_pin.as_str())?;
+                self.conn.update_time(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                )?;
+                self.retry_command(client_id, fun, max_trys - 1)
+            }
+            Err(TseError::CmdError(ERROR_NEEDS_ACTIVE_CTSS, ..)) => {
+                self.conn.enable_ctss_interface()?;
+                self.retry_command(client_id, fun, max_trys - 1)
+            }
+            Err(TseError::CmdError(ERROR_NOT_AUTHORIZED, ..)) => {
+                self.conn
+                    .login(UserId::TimeAdmin, self.time_admin_pin.as_str())?;
+                self.retry_command(client_id, fun, max_trys - 1)
+            }
+            Err(TseError::CmdError(ERROR_NOT_INITIALIZED, ..)) => {
+                self.conn.initialize()?;
+                self.retry_command(client_id, fun, max_trys - 1)
+            }
+            r => r,
+        }
     }
 }
