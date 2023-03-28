@@ -1,5 +1,5 @@
 extern crate byteorder;
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 extern crate windows;
 
 #[cfg(target_os = "linux")]
@@ -10,7 +10,10 @@ use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
+#[cfg(target_os = "windows")]
 use std::os::windows::io::{FromRawHandle, RawHandle};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug)]
 pub enum TseError {
     IO(std::io::Error),
+    #[cfg(target_os = "windows")]
     Win(windows::core::Error),
     Timeout,
     CmdError(u16, Vec<u8>),
@@ -42,7 +46,7 @@ pub const ERROR_NEEDS_SELF_TEST: u16 = 4180;
 pub const ERROR_NEEDS_SELF_TEST_PASSED: u16 = 4181;
 pub const ERROR_NOT_INITIALIZED: u16 = 4351;
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn open_file_direct(filename: OsString) -> Result<File> {
     use windows::core::PCSTR;
     use windows::Win32::Storage::FileSystem;
@@ -208,12 +212,10 @@ impl TseCommunication {
     fn read(&mut self, buffer: &mut [u8]) -> Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.read_exact(buffer)?;
-        println!("READ {:?}", buffer);
         Ok(())
     }
 
     fn write(&mut self, buffer: &[u8]) -> Result<()> {
-        println!("WRITE {:?}", buffer);
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(buffer)?;
         Ok(())
