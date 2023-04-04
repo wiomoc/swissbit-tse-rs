@@ -1,21 +1,22 @@
-#[macro_use]
 extern crate clap;
 extern crate core;
 
-use base64::alphabet::STANDARD;
-use clap::builder::Str;
+
+
 use clap::Parser;
 use rouille::input::{basic_http_auth, json_input};
 use rouille::Response;
 use rouille::{Request, ResponseBody};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+
 use std::collections::HashMap;
 use std::fmt::{Debug};
 use std::ops::Add;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use swissbit_tse::{Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo, ERROR_CLIENT_NOT_REGISTERED};
 
 #[derive(Parser, Debug)]
@@ -56,7 +57,7 @@ fn main() {
         .client
         .iter()
         .map(|client_id_and_password| {
-            if let Some(seperator_pos) = client_id_and_password.find(":") {
+            if let Some(seperator_pos) = client_id_and_password.find(':') {
                 client_id_and_password[..seperator_pos].to_string()
             } else {
                 panic!("Could not parse client id / password, seperator missing")
@@ -91,10 +92,10 @@ fn main() {
                     Response::json(&*tse_info)
                 },
                 (POST) ["/transaction/start"] => {
-                    handle_transaction_request(request, &*tse_state, &credentials.login, None)
+                    handle_transaction_request(request, &tse_state, &credentials.login, None)
                 },
                 (POST) ["/transaction/{id}/finish", id: u64] => {
-                   handle_transaction_request(request, &*tse_state, &credentials.login, Some(id))
+                   handle_transaction_request(request, &tse_state, &credentials.login, Some(id))
                 },
                 _ => Response::empty_404()
             )
@@ -112,7 +113,7 @@ fn handle_transaction_request(
 ) -> Response {
     if let Ok(body) = json_input::<SignTransactionRequest>(request) {
         if let Ok(mut tse_state) = tse_state.lock() {
-            if let Ok(process_data) = base64::decode(&body.process_data) {
+            if let Ok(process_data) = STANDARD.decode(&body.process_data) {
                 let transaction_result = if let Some(transaction_id) = transaction_id {
                     tse_state.finish_transaction(
                         client_id,
@@ -192,10 +193,10 @@ impl From<&SignedTransaction> for EncodedSignedTransaction {
     fn from(value: &SignedTransaction) -> Self {
         EncodedSignedTransaction {
             transaction_id: value.transaction_id,
-            serial: base64::encode(&value.serial),
+            serial: STANDARD.encode(&value.serial),
             log_time: value.log_time,
             signature_counter: value.signature_counter,
-            signature: base64::encode(&value.signature),
+            signature: STANDARD.encode(&value.signature),
         }
     }
 }
@@ -230,7 +231,7 @@ impl State {
                         //return Err("Could not register client - missing admin pin".to_string());
                     }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
 
@@ -247,9 +248,9 @@ impl State {
                 signature_algorithm: "ecdsa-plain-SHA384",
                 time_format: "unixTime",
                 process_data_encoding: "UTF-8",
-                serial: base64::encode(tse_info.serial_number),
+                serial: STANDARD.encode(tse_info.serial_number),
                 certificate: String::from_utf8(certificate).unwrap(),
-                public_key: base64::encode(tse_info.public_key),
+                public_key: STANDARD.encode(tse_info.public_key),
             },
         ))
     }
