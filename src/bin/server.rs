@@ -17,7 +17,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use swissbit_tse::{Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo, ERROR_CLIENT_NOT_REGISTERED};
-use windows::Win32::Foundation::SCARD_E_TIMEOUT;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

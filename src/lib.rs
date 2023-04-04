@@ -156,7 +156,7 @@ impl TseInfo {
     pub fn read<P: AsRef<Path>>(path: P) -> Result<TseInfo> {
         let filename = path
             .as_ref()
-            .with_file_name("TSE_INFO.DAT")
+            .join("TSE_INFO.DAT")
             .into_os_string();
         let mut info_file_contents = vec![0u8; BLOCK_SIZE];
         open_file_direct(filename)?.read_exact(&mut info_file_contents)?;
@@ -203,8 +203,9 @@ impl TseCommunication {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let filename = path
             .as_ref()
-            .with_file_name("TSE_COMM.DAT")
+            .join("TSE_COMM.DAT")
             .into_os_string();
+        println!("{:?}", &filename);
         let file = open_file_direct(filename)?;
         Ok(TseCommunication { file })
     }
@@ -438,7 +439,7 @@ impl TseTarFiles {
         for file_num in 1..100 {
             let filename = path
                 .as_ref()
-                .with_file_name(format!("TSE_TAR.{number:0>3}", number = file_num))
+                .join(format!("TSE_TAR.{number:0>3}", number = file_num))
                 .into_os_string();
             if let Ok(file) = open_file_direct(filename) {
                 files.push(file);
