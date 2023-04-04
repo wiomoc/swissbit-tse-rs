@@ -5,6 +5,7 @@ extern crate windows;
 #[cfg(target_os = "linux")]
 extern crate libc;
 
+extern crate maligned;
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
 use std::ffi::{CString, OsString};
 use std::fs::File;
@@ -17,6 +18,7 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use maligned::{A512, align_first, align_first_boxed_cloned};
 
 #[derive(Debug)]
 pub enum TseError {
@@ -158,7 +160,7 @@ impl TseInfo {
             .as_ref()
             .join("TSE_INFO.DAT")
             .into_os_string();
-        let mut info_file_contents = vec![0u8; BLOCK_SIZE];
+        let mut info_file_contents = align_first_boxed_cloned::<u8, A512>(BLOCK_SIZE, 0u8);
         open_file_direct(filename)?.read_exact(&mut info_file_contents)?;
 
         let read_int = |pos: usize| BigEndian::read_u32(&info_file_contents[pos..pos + 4]);
@@ -205,32 +207,35 @@ impl TseCommunication {
             .as_ref()
             .join("TSE_COMM.DAT")
             .into_os_string();
-        println!("{:?}", &filename);
         let file = open_file_direct(filename)?;
         Ok(TseCommunication { file })
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<()> {
+        assert_eq!(buffer.len(), BLOCK_SIZE);
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_exact(buffer)?;
+        let bytes_read = self.file.read(buffer)?;
+        assert_eq!(bytes_read, BLOCK_SIZE);
         Ok(())
     }
 
     fn write(&mut self, buffer: &[u8]) -> Result<()> {
+        assert_eq!(buffer.len(), BLOCK_SIZE);
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(buffer)?;
+        let bytes_written = self.file.write(buffer)?;
+        assert_eq!(bytes_written, BLOCK_SIZE);
         Ok(())
     }
 
     fn write_command(&mut self, cmd: &[u8]) -> Result<()> {
-        let mut buf = Cursor::new(vec![0u8; BLOCK_SIZE]);
-        buf.write_u16::<BigEndian>(cmd.len() as u16).unwrap();
-        buf.write_all(cmd).unwrap();
-        self.write(buf.get_ref())
+        let mut buf = align_first_boxed_cloned::<u8, A512>(BLOCK_SIZE, 0);
+        BigEndian::write_u16(&mut buf[..2], cmd.len() as u16);
+        (&mut buf[2..(2 + cmd.len())]).copy_from_slice(cmd);
+        self.write(&buf)
     }
 
     fn send_command(&mut self, cmd: &[u8]) -> Result<Vec<u8>> {
-        let mut read_buf = [0u8; BLOCK_SIZE];
+        let mut read_buf = align_first_boxed_cloned::<u8, A512>(BLOCK_SIZE, 0);
         self.read(&mut read_buf)?;
         let _before_counter = BigEndian::read_u32(&read_buf[0..4]);
         self.write_command(cmd)?;
@@ -472,7 +477,7 @@ impl TseTarFiles {
                 data = &data[BLOCK_SIZE..];
                 block_offset += BLOCK_SIZE
             } else {
-                let mut buf = vec![0u8; BLOCK_SIZE];
+                let mut buf =align_first_boxed_cloned::<u8, A512>(BLOCK_SIZE, 0u8);
                 buf[..data.len()].copy_from_slice(data);
                 file.write_all(&buf)?;
                 break;

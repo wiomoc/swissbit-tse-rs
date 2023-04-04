@@ -1,23 +1,24 @@
 extern crate clap;
 extern crate core;
 
-
-
 use clap::Parser;
 use rouille::input::{basic_http_auth, json_input};
 use rouille::Response;
 use rouille::{Request, ResponseBody};
 use serde::{Deserialize, Serialize};
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use std::collections::HashMap;
-use std::fmt::{Debug};
+use std::fmt::Debug;
 use std::ops::Add;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use swissbit_tse::{Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo, ERROR_CLIENT_NOT_REGISTERED};
+use swissbit_tse::{
+    Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo,
+    ERROR_CLIENT_NOT_REGISTERED,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -261,13 +262,17 @@ impl State {
         process_type: &str,
         process_data: &[u8],
     ) -> Result<SignedTransaction> {
-        let signed_transaction = self.tse.persist_transaction(
+        let signed_transaction = match self.tse.persist_transaction(
             client_id,
             TransactionEvent::Start,
             0,
             process_type,
             process_data,
-        )?;
+        ) {
+            Ok(signed_transaction) => signed_transaction,
+            Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
+            Err(e) => return Err(e),
+        };
         self.transaction_states.insert(
             (client_id.to_string(), signed_transaction.transaction_id),
             TransactionState {
@@ -284,13 +289,17 @@ impl State {
         process_type: &str,
         process_data: &[u8],
     ) -> Result<SignedTransaction> {
-        let signed_transaction = self.tse.persist_transaction(
+        let signed_transaction = match self.tse.persist_transaction(
             client_id,
             TransactionEvent::Finish,
             transaction_id,
             process_type,
             process_data,
-        )?;
+        ) {
+            Ok(signed_transaction) => signed_transaction,
+            Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
+            Err(e) => return Err(e),
+        };
         self.transaction_states
             .remove(&(client_id.to_string(), signed_transaction.transaction_id));
         Ok(signed_transaction)
