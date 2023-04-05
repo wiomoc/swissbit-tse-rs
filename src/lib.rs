@@ -18,7 +18,7 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use maligned::{A512, align_first, align_first_boxed_cloned};
+use maligned::{A512, align_first_boxed_cloned};
 
 #[derive(Debug)]
 pub enum TseError {
@@ -230,7 +230,7 @@ impl TseCommunication {
     fn write_command(&mut self, cmd: &[u8]) -> Result<()> {
         let mut buf = align_first_boxed_cloned::<u8, A512>(BLOCK_SIZE, 0);
         BigEndian::write_u16(&mut buf[..2], cmd.len() as u16);
-        (&mut buf[2..(2 + cmd.len())]).copy_from_slice(cmd);
+        buf[2..(2 + cmd.len())].copy_from_slice(cmd);
         self.write(&buf)
     }
 

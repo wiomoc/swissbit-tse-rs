@@ -1,5 +1,7 @@
 extern crate clap;
 extern crate core;
+extern crate time;
+extern crate timer;
 
 use clap::Parser;
 use rouille::input::{basic_http_auth, json_input};
@@ -9,16 +11,16 @@ use serde::{Deserialize, Serialize};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
-use std::ops::Add;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use swissbit_tse::{
     Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo,
     ERROR_CLIENT_NOT_REGISTERED,
 };
+use time::Duration;
+use timer::Timer;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -71,7 +73,7 @@ fn main() {
         client_ids,
         args.time_admin_pin,
         args.admin_pin,
-        Duration::from_secs(args.transaction_timeout),
+        Duration::seconds(args.transaction_timeout as i64),
     )
     .unwrap();
     println!("Connection with TSE initialized");
@@ -155,14 +157,11 @@ fn handle_transaction_request(
     Response::empty_400()
 }
 
-struct TransactionState {
-    timeout_time: Instant,
-}
-
 struct State {
-    tse: Tse,
-    transaction_states: HashMap<(String, u64), TransactionState>,
+    tse: Arc<Mutex<Tse>>,
+    pending_transactions: Arc<Mutex<HashSet<(String, u64)>>>,
     transaction_timeout: Duration,
+    timer: Timer,
 }
 
 #[derive(Serialize)]
@@ -210,24 +209,34 @@ impl State {
         admin_pin: Option<String>,
         transaction_timeout: Duration,
     ) -> Result<(Self, TseInformation)> {
-        let mut tse = Tse::open(&path, time_admin_pin)?;
+        let tse = Arc::new(Mutex::new(Tse::open(&path, time_admin_pin)?));
+        let timer = Timer::new();
 
-        let mut transaction_states = HashMap::new();
+        let pending_transactions = Arc::new(Mutex::new(HashSet::new()));
         for client_id in client_ids.iter() {
-            match tse.list_started_transactions(client_id) {
+            match tse.lock().unwrap().list_started_transactions(client_id) {
                 Ok(transactions) => {
                     for transaction in transactions {
-                        transaction_states.insert(
-                            (client_id.clone(), transaction),
-                            TransactionState {
-                                timeout_time: Instant::now().add(transaction_timeout),
-                            },
-                        );
+                        let client_id = client_id.clone();
+                        let tse = tse.clone();
+                        timer.schedule_with_delay(transaction_timeout, move || {
+                            if let Err(err) = tse.lock().unwrap().persist_transaction(
+                                client_id.as_ref(),
+                                TransactionEvent::Finish,
+                                transaction,
+                                "SonstigerVorgang",
+                                b"Timeout",
+                            ) {
+                                println!("Could not finish transaction {:?}", err);
+                            }
+                        });
                     }
                 }
                 Err(TseError::CmdError(ERROR_CLIENT_NOT_REGISTERED, ..)) => {
                     if let Some(admin_pin) = admin_pin.as_ref() {
-                        tse.register_client(client_id, Some(admin_pin.as_str()))?;
+                        tse.lock()
+                            .unwrap()
+                            .register_client(client_id, Some(admin_pin.as_str()))?;
                     } else {
                         //return Err("Could not register client - missing admin pin".to_string());
                     }
@@ -238,11 +247,12 @@ impl State {
 
         let tse_info = TseInfo::read(path)?;
 
-        let certificate = tse.read_certificate()?;
+        let certificate = tse.lock().unwrap().read_certificate()?;
         Ok((
             Self {
+                timer,
                 tse,
-                transaction_states,
+                pending_transactions,
                 transaction_timeout,
             },
             TseInformation {
@@ -257,12 +267,12 @@ impl State {
     }
 
     fn start_transaction(
-        &mut self,
+        &self,
         client_id: &str,
         process_type: &str,
         process_data: &[u8],
     ) -> Result<SignedTransaction> {
-        let signed_transaction = match self.tse.persist_transaction(
+        let signed_transaction = match self.tse.lock().unwrap().persist_transaction(
             client_id,
             TransactionEvent::Start,
             0,
@@ -273,12 +283,32 @@ impl State {
             Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
             Err(e) => return Err(e),
         };
-        self.transaction_states.insert(
-            (client_id.to_string(), signed_transaction.transaction_id),
-            TransactionState {
-                timeout_time: Instant::now().add(self.transaction_timeout),
-            },
-        );
+
+        self.pending_transactions
+            .lock()
+            .unwrap()
+            .insert((client_id.to_string(), signed_transaction.transaction_id));
+        let pending_transactions = self.pending_transactions.clone();
+        let client_id = client_id.to_string();
+        let tse = self.tse.clone();
+        let transaction_id = signed_transaction.transaction_id;
+        self.timer
+            .schedule_with_delay(self.transaction_timeout, move || {
+                if pending_transactions
+                    .lock()
+                    .unwrap()
+                    .remove(&(client_id.to_string(), signed_transaction.transaction_id)) {
+                    if let Err(err) = tse.lock().unwrap().persist_transaction(
+                        client_id.as_ref(),
+                        TransactionEvent::Finish,
+                        transaction_id,
+                        "SonstigerVorgang",
+                        b"Timeout",
+                    ) {
+                        println!("Could not finish transaction {:?}", err);
+                    }
+                }
+            });
         Ok(signed_transaction)
     }
 
@@ -289,7 +319,7 @@ impl State {
         process_type: &str,
         process_data: &[u8],
     ) -> Result<SignedTransaction> {
-        let signed_transaction = match self.tse.persist_transaction(
+        let signed_transaction = match self.tse.lock().unwrap().persist_transaction(
             client_id,
             TransactionEvent::Finish,
             transaction_id,
@@ -300,30 +330,10 @@ impl State {
             Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
             Err(e) => return Err(e),
         };
-        self.transaction_states
+        self.pending_transactions
+            .lock()
+            .unwrap()
             .remove(&(client_id.to_string(), signed_transaction.transaction_id));
         Ok(signed_transaction)
-    }
-
-    fn finish_timedout_transactions(&mut self) {
-        let now = Instant::now();
-
-        self.transaction_states
-            .retain(|(client_id, transaction_id), state| {
-                if state.timeout_time < now {
-                    if let Err(err) = self.tse.persist_transaction(
-                        client_id,
-                        TransactionEvent::Finish,
-                        *transaction_id,
-                        "SonstigerVorgang",
-                        b"Timeout",
-                    ) {
-                        println!("Could not finish transaction {:?}", err);
-                    }
-                    false
-                } else {
-                    true
-                }
-            })
     }
 }
