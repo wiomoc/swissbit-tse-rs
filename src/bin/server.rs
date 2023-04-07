@@ -14,6 +14,7 @@ use base64::Engine;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::Path;
+use std::process::exit;
 use std::sync::{Arc, Mutex};
 use swissbit_tse::{
     Result, SignedTransaction, TransactionEvent, Tse, TseError, TseInfo,
@@ -280,7 +281,10 @@ impl State {
             process_data,
         ) {
             Ok(signed_transaction) => signed_transaction,
-            Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
+            Err(TseError::IO(e)) => {
+                eprintln!("IO Error {:?}", e);
+                exit(1);
+            }
             Err(e) => return Err(e),
         };
 
@@ -297,7 +301,8 @@ impl State {
                 if pending_transactions
                     .lock()
                     .unwrap()
-                    .remove(&(client_id.to_string(), signed_transaction.transaction_id)) {
+                    .remove(&(client_id.to_string(), signed_transaction.transaction_id))
+                {
                     if let Err(err) = tse.lock().unwrap().persist_transaction(
                         client_id.as_ref(),
                         TransactionEvent::Finish,
@@ -327,7 +332,10 @@ impl State {
             process_data,
         ) {
             Ok(signed_transaction) => signed_transaction,
-            Err(TseError::IO(e)) => panic!("IO Error {:?}", e),
+            Err(TseError::IO(e)) => {
+                eprintln!("IO Error {:?}", e);
+                exit(1);
+            },
             Err(e) => return Err(e),
         };
         self.pending_transactions
