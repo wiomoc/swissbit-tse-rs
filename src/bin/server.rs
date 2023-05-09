@@ -230,7 +230,7 @@ impl State {
                             ) {
                                 println!("Could not finish transaction {:?}", err);
                             }
-                        });
+                        }).ignore();
                     }
                 }
                 Err(TseError::CmdError(ERROR_CLIENT_NOT_REGISTERED, ..)) => {
@@ -313,7 +313,7 @@ impl State {
                         println!("Could not finish transaction {:?}", err);
                     }
                 }
-            });
+            }).ignore();
         Ok(signed_transaction)
     }
 
